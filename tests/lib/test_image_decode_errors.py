@@ -3,6 +3,7 @@ from io import BytesIO
 from unittest.mock import AsyncMock
 
 import pytest
+from PIL import GifImagePlugin
 from PIL import Image as PILImage
 from starlette.exceptions import HTTPException
 
@@ -81,13 +82,35 @@ async def test_lazy_decode_errors_have_friendly_feedback(
     def fail(*args, **kwargs):
         raise OSError('synthetic lazy decoder failure')
 
+    data = _png()
+    animation_frames = []
     if stage == 'exif':
         monkeypatch.setattr(image_module.ImageOps, 'exif_transpose', fail)
     else:
-        monkeypatch.setattr(image_module, '_extract_animation', fail)
+        buffer = BytesIO()
+        PILImage.new('RGB', (8, 8), 'blue').save(
+            buffer,
+            format='GIF',
+            save_all=True,
+            append_images=[PILImage.new('RGB', (8, 8), 'red')],
+            duration=100,
+            loop=0,
+        )
+        data = buffer.getvalue()
+        seek = GifImagePlugin.GifImageFile.seek
+
+        def fail_animation(image, frame):
+            if frame == 1:
+                animation_frames.append(frame)
+                fail()
+            return seek(image, frame)
+
+        monkeypatch.setattr(GifImagePlugin.GifImageFile, 'seek', fail_animation)
     with pytest.raises(HTTPException) as exc:
-        await image_module.Image.normalize_avatar(_png())
+        await image_module.Image.normalize_avatar(data)
     assert _message(exc.value) == 'validation.image_not_readable'
+    if stage == 'animation':
+        assert animation_frames == [1]
 
 
 async def test_output_encoder_error_is_not_mislabeled_as_input(
