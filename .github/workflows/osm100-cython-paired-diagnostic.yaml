@@ -1,0 +1,107 @@
+name: OSM100 paired Cython finalization diagnostic
+
+# Publishing this exact file on the isolated branch activates one paired run.
+on:
+  push:
+    branches:
+      - diagnostic/osm100-cython-finalization-20261004
+    paths:
+      - .github/workflows/osm100-cython-paired-diagnostic.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: >-
+      github.repository == 'Gaviate/openstreetmap-ng' &&
+      github.event.repository.private == false &&
+      github.ref == 'refs/heads/diagnostic/osm100-cython-finalization-20261004' &&
+      github.event_name == 'push' && github.run_attempt == 1
+    name: Cython diagnostic (${{ matrix.source }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: original
+            ref: 1bc015d178b2976737a159084aac484426466279
+          - source: published
+            ref: 31c9a8ff505a0506c56258eedae969be0515f5b9
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Gaviate/openstreetmap-ng
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+
+      - name: Assert the immutable source revision
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ matrix.ref }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          printf 'checkout_sha=%s\nrunner_os=%s\nimage_os=%s\nimage_version=%s\n' \
+            "$EXPECTED_SHA" "$RUNNER_OS" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+
+      - uses: ./.github/actions/setup
+
+      - name: Build Cython modules and report runtime metadata
+        shell: bash
+        run: |
+          nix-shell --pure --run 'cython-build-fast &&
+          python - << "PY"
+          import hashlib
+          import importlib.metadata
+          import json
+          import os
+          import sys
+          import sysconfig
+          from pathlib import Path
+          from _pytest.config import get_config
+
+          files = {
+              "shell.nix": "a35b1540ebadc88e2435f3a4e107637c48cba0cbcc0996dd6356a87275642aa7",
+              "uv.lock": "a8b8fd4f6b08c2e9ed649eb91215dbec3c0a6f7c720047df651626240ed1bb3a",
+              "shellscripts/cython-build.sh": "57ff95e816532090d736a22882998b92d9657ed6cca3c2415d4cfd82829f8f17",
+              "shellscripts/cython-build-fast.sh": "658566a34a1f7f011b644a20a857308851be7992504f93c697c7a7674afaa2ad",
+              "shellscripts/run-tests.sh": "30e3ec83e714833b889fd7cb9e0ac2b6eba95555f230e1d7684ec2851d92e9f4",
+          }
+          for name, expected in files.items():
+              assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected, name
+          roots = ["app/exceptions", "app/format", "app/lib", "app/middlewares", "app/responses", "app/services", "app/queries", "app/validators"]
+          blacklist = {"app/services/optimistic_diff/__init__.py", "app/lib/settings_integration.py"}
+          sources = [p for root in roots for p in Path(root).rglob("*.py") if p.as_posix() not in blacklist]
+          sources += [Path(p) for p in ["app/db.py", "app/utils.py", "app/models/element.py", "app/models/scope.py", "scripts/preload_convert.py", "scripts/replication_download.py", "scripts/replication_generate.py"]]
+          assert len(sources) == 187, len(sources)
+          suffix = sysconfig.get_config_var("EXT_SUFFIX")
+          missing = [str(p) for p in sources if not p.with_suffix(suffix).is_file()]
+          assert not missing, missing
+          seed_config = get_config()
+          seed_config.pluginmanager.import_plugin("pytest_randomly")
+          seed_options = seed_config._parser.parse(["--randomly-seed=1", "--randomly-seed=1791084292"])
+          assert seed_options.randomly_seed == 1791084292, seed_options.randomly_seed
+          print(json.dumps({
+              "python_version": sys.version,
+              "python_executable": sys.executable,
+              "tool_versions": {name: importlib.metadata.version(name) for name in ["Cython", "coverage", "pytest", "pytest-asyncio"]},
+              "coverage_core": os.environ.get("COVERAGE_CORE"),
+              "compiled_source_count": len(sources),
+              "effective_trailing_randomly_seed": seed_options.randomly_seed,
+              "extension_suffix": suffix,
+              "pipeline_sha256": files,
+              "cython_profile": True,
+              "CYTHON_PROFILE": 1,
+              "CYTHON_USE_SYS_MONITORING": 0
+          }, indent=2))
+          PY
+          '
+
+      - name: Start services
+        run: |
+          nix-shell --pure --run "dev-start"
+
+      - name: Run tests
+        run: |
+          # The existing wrapper appends arguments after its timestamp seed.
+          nix-shell --pure --run "run-tests --extended --term --randomly-seed=1791084292"
